@@ -1,6 +1,6 @@
 use serenity::{
     async_trait,
-    model::{channel::Message, gateway::Ready, id::{GuildId, ChannelId}},
+    model::{gateway::Ready, id::GuildId, interaction::{Interaction, InteractionResponseType}},
     prelude::*,
 };
 use songbird::{SerenityInit, input::ffmpeg};
@@ -10,115 +10,88 @@ use dotenv::dotenv;
 use std::env;
 use urlencoding::encode;
 
-/// イベントハンドラ本体
-struct Handler;
-
-/// ギルドごとのVC参加情報を保持するキー
 struct BotState;
 impl TypeMapKey for BotState {
-    type Value = Arc<Mutex<HashMap<GuildId, ChannelId>>>;
+    type Value = Arc<Mutex<HashMap<GuildId, serenity::model::id::ChannelId>>>;
 }
+
+struct Handler;
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn message(&self, ctx: Context, msg: Message) {
-        if msg.author.bot {
-            return;
-        }
-        let guild_id = match msg.guild_id {
-            Some(id) => id,
-            None => return,
-        };
-
-        // VC参加マップを取得
-        let data = ctx.data.read().await;
-        let vc_map = data.get::<BotState>().unwrap().clone();
-        let mut vc_map = vc_map.lock().await;
-
-        // !join コマンド
-        if msg.content == "!join" {
-            if let Some(guild) = ctx.cache.guild(guild_id) {
-                if let Some(vs) = guild.voice_states.get(&msg.author.id) {
-                    if let Some(vc_chan) = vs.channel_id {
-                        let manager = songbird::get(&ctx).await.unwrap().clone();
-                        let _ = manager.join(guild_id, vc_chan).await;
-                        vc_map.insert(guild_id, vc_chan);
-                        let _ = msg.channel_id
-                            .say(&ctx.http, "読み上げを開始します。")
-                            .await;
-                        return;
-                    }
-                }
-            }
-            let _ = msg.channel_id
-                .say(&ctx.http, "VCに参加してから `!join` を送ってください。")
-                .await;
-        }
-        // !leave コマンド
-        else if msg.content == "!leave" {
-            if vc_map.remove(&guild_id).is_some() {
-                let manager = songbird::get(&ctx).await.unwrap().clone();
-                let _ = manager.remove(guild_id).await;
-                let _ = msg.channel_id
-                    .say(&ctx.http, "VCから切断しました。")
-                    .await;
-            } else {
-                let _ = msg.channel_id
-                    .say(&ctx.http, "VC参加情報がありません。")
-                    .await;
-            }
-        }
-        // それ以外 → 読み上げ
-        else if vc_map.contains_key(&guild_id) {
-            // 環境変数 or デフォルト
-            let addr = env::var("TTS_SERVER_URL").unwrap_or_else(|_| "127.0.0.1:5007".into());
-            let url = format!(
-                "http://{}/synthesize?text={}",
-                addr,
-                encode(&msg.content)
-            );
-
-            // ffmpeg に URL を渡してストリーミング再生
-            let manager = songbird::get(&ctx).await.unwrap().clone();
-            if let Some(handler_lock) = manager.get(guild_id) {
-                let mut handler = handler_lock.lock().await;
-                match ffmpeg(&url).await {
-                    Ok(source) => {
-                        // unit 型のアームに統一
-                        handler.play_source(source);
-                    }
-                    Err(e) => {
-                        let _ = msg.channel_id
-                            .say(&ctx.http, format!("❌ 音声再生に失敗しました: {}", e))
-                            .await;
-                    }
-                }
-            }
-        }
-    }
-
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         println!("✅ ログイン成功: {}", ready.user.name);
+        // ギルドIDを指定（複数ギルドやグローバル化は適宜変更）
+        let guild_id = GuildId(
+            env::var("DISCORD_GUILD_ID")
+                .expect("環境変数 DISCORD_GUILD_ID が設定されていません")
+                .parse()
+                .expect("DISCORD_GUILD_ID の値が無効です。数値である必要があります"),
+        );
+        // /join と /leave スラッシュコマンドを登録
+        guild_id.set_guild_application_commands(&ctx.http, |commands| {
+            commands
+                .create_application_command(|cmd| cmd.name("join").description("VCに参加します"))
+                .create_application_command(|cmd| cmd.name("leave").description("VCから退出します"))
+        }).await.expect("コマンド登録失敗");
     }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        if let Interaction::ApplicationCommand(cmd) = interaction {
+            let content = match cmd.data.name.as_str() {
+                "join" => {
+                    let guild_id = cmd.guild_id.unwrap();
+                    if let Some(member) = cmd.member.clone() {
+                        if let Some(vc) = member.voice.as_ref().and_then(|v| v.channel_id) {
+                            let manager = songbird::get(&ctx).await.unwrap().clone();
+                            let _ = manager.join(guild_id, vc).await;
+                            // 状態に保存
+                            let data = ctx.data.read().await;
+                            let map = data.get::<BotState>().unwrap().clone();
+                            map.lock().await.insert(guild_id, vc);
+                            "✅ ボイスチャネルに参加しました。".to_string()
+                        } else {
+                            "⚠️ まずVCに参加してください。".to_string()
+                        }
+                    } else { "⚠️ メンバー情報が取得できません。".to_string() }
+                }
+                "leave" => {
+                    let guild_id = cmd.guild_id.unwrap();
+                    let data = ctx.data.read().await;
+                    let map = data.get::<BotState>().unwrap().clone();
+                    if map.lock().await.remove(&guild_id).is_some() {
+                        let manager = songbird::get(&ctx).await.unwrap().clone();
+                        let _ = manager.remove(guild_id).await;
+                        "👋 VCから退出しました。".to_string()
+                    } else {
+                        "⚠️ VC参加情報がありません。".to_string()
+                    }
+                }
+                _ => return,
+            };
+            let _ = cmd.create_interaction_response(&ctx.http, |r| {
+                r.kind(InteractionResponseType::ChannelMessageWithSource)
+                 .interaction_response_data(|m| m.content(content).ephemeral(true))
+            }).await;
+        }
+    }
+
+    // 旧 prefix 処理を残す場合のみ実装
+    // async fn message(&self, ctx: Context, msg: Message) { ... }
 }
 
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    let token = env::var("DISCORD_TOKEN")
-        .expect("DISCORD_TOKEN が設定されていません");
-
-    let intents = GatewayIntents::GUILDS
-        | GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::GUILD_VOICE_STATES
-        | GatewayIntents::MESSAGE_CONTENT;
-
-    let mut client = serenity::Client::builder(&token, intents)
+    let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKENが設定されていません");
+    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
+    let mut client = Client::builder(&token, intents)
         .event_handler(Handler)
         .register_songbird()
         .await
         .expect("Client作成失敗");
 
+    // 状態の初期化
     {
         let mut data = client.data.write().await;
         data.insert::<BotState>(Arc::new(Mutex::new(HashMap::new())));
