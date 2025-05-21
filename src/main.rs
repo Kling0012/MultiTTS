@@ -22,7 +22,12 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("✅ ログイン成功: {}", ready.user.name);
         // ギルドIDを指定（複数ギルドやグローバル化は適宜変更）
-        let guild_id = GuildId(env::var("DISCORD_GUILD_ID").unwrap().parse().unwrap());
+        let guild_id = GuildId(
+            env::var("DISCORD_GUILD_ID")
+                .expect("環境変数 DISCORD_GUILD_ID が設定されていません")
+                .parse()
+                .expect("DISCORD_GUILD_ID の値が無効です。数値である必要があります"),
+        );
         // /join と /leave スラッシュコマンドを登録
         guild_id.set_guild_application_commands(&ctx.http, |commands| {
             commands
