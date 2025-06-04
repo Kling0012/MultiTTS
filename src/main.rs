@@ -30,9 +30,14 @@ fn is_chinese(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+struct ChannelInfo {
+    voice: serenity::model::id::ChannelId,
+    text: serenity::model::id::ChannelId,
+}
+
 struct BotState;
 impl TypeMapKey for BotState {
-    type Value = Arc<Mutex<HashMap<GuildId, serenity::model::id::ChannelId>>>;
+    type Value = Arc<Mutex<HashMap<GuildId, ChannelInfo>>>;
 }
 
 struct Handler;
@@ -86,7 +91,13 @@ impl EventHandler for Handler {
                             // 状態に保存
                             let data = ctx.data.read().await;
                             let map = data.get::<BotState>().unwrap().clone();
-                            map.lock().await.insert(guild_id, vc);
+                            map.lock().await.insert(
+                                guild_id,
+                                ChannelInfo {
+                                    voice: vc,
+                                    text: cmd.channel_id,
+                                },
+                            );
                             "✅ ボイスチャネルに参加しました。".to_string()
                         } else {
                             "⚠️ まずVCに参加してください。".to_string()
@@ -109,7 +120,7 @@ impl EventHandler for Handler {
                     let guild_id = cmd.guild_id.unwrap();
                     let data = ctx.data.read().await;
                     let map = data.get::<BotState>().unwrap().clone();
-                    if let Some(vc) = map.lock().await.get(&guild_id).cloned() {
+                    if let Some(info) = map.lock().await.get(&guild_id).cloned() {
                         let manager = songbird::get(&ctx).await.unwrap().clone();
                         if let Some(handler) = manager.get(guild_id) {
                             let text = cmd
@@ -148,19 +159,18 @@ impl EventHandler for Handler {
             return;
         }
 
-        if !is_chinese(&msg.content) {
-            return;
-        }
-
         if let Some(guild_id) = msg.guild_id {
             let data = ctx.data.read().await;
             let map = data.get::<BotState>().unwrap().clone();
-            if let Some(vc) = map.lock().await.get(&guild_id).cloned() {
-                let manager = songbird::get(&ctx).await.unwrap().clone();
-                if let Some(handler) = manager.get(guild_id) {
-                    let url = build_tts_url(&msg.content, "zh-CN");
-                    if let Ok(source) = ffmpeg(url).await {
-                        handler.lock().await.play_source(source);
+            if let Some(info) = map.lock().await.get(&guild_id).cloned() {
+                if info.text == msg.channel_id {
+                    let manager = songbird::get(&ctx).await.unwrap().clone();
+                    if let Some(handler) = manager.get(guild_id) {
+                        let lang = if is_chinese(&msg.content) { "zh-CN" } else { "ja" };
+                        let url = build_tts_url(&msg.content, lang);
+                        if let Ok(source) = ffmpeg(url).await {
+                            handler.lock().await.play_source(source);
+                        }
                     }
                 }
             }
