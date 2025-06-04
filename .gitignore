@@ -18,3 +18,4 @@ target/
 .venv
 .env
 *.env
+*.lock
