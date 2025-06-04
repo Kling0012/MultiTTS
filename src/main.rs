@@ -3,7 +3,7 @@ use serenity::{
     model::{
         gateway::Ready,
         id::GuildId,
-        interaction::{Interaction, InteractionResponseType},
+        interactions::{Interaction, InteractionResponseType},
         prelude::Message,
     },
     prelude::*,
@@ -50,7 +50,7 @@ impl EventHandler for Handler {
         );
         // スラッシュコマンドを登録
         guild_id
-            .set_guild_application_commands(&ctx.http, |commands| {
+            .set_application_commands(&ctx.http, |commands| {
                 commands
                     .create_application_command(|cmd| {
                         cmd.name("join").description("VCに参加します")
@@ -109,7 +109,7 @@ impl EventHandler for Handler {
                     let guild_id = cmd.guild_id.unwrap();
                     let data = ctx.data.read().await;
                     let map = data.get::<BotState>().unwrap().clone();
-                    if let Some(vc) = map.lock().await.get(&guild_id).cloned() {
+                    if map.lock().await.get(&guild_id).is_some() {
                         let manager = songbird::get(&ctx).await.unwrap().clone();
                         if let Some(handler) = manager.get(guild_id) {
                             let text = cmd
@@ -155,7 +155,7 @@ impl EventHandler for Handler {
         if let Some(guild_id) = msg.guild_id {
             let data = ctx.data.read().await;
             let map = data.get::<BotState>().unwrap().clone();
-            if let Some(vc) = map.lock().await.get(&guild_id).cloned() {
+            if map.lock().await.get(&guild_id).is_some() {
                 let manager = songbird::get(&ctx).await.unwrap().clone();
                 if let Some(handler) = manager.get(guild_id) {
                     let url = build_tts_url(&msg.content, "zh-CN");
