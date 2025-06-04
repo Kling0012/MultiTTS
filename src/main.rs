@@ -1,6 +1,11 @@
 use serenity::{
     async_trait,
-    model::{gateway::Ready, id::GuildId, interaction::{Interaction, InteractionResponseType}},
+    model::{
+        gateway::Ready,
+        id::GuildId,
+        interaction::{Interaction, InteractionResponseType},
+        prelude::Message,
+    },
     prelude::*,
 };
 use songbird::{SerenityInit, input::ffmpeg};
@@ -9,12 +14,20 @@ use tokio::sync::Mutex;
 use dotenv::dotenv;
 use std::env;
 use urlencoding::encode;
+use whatlang::{detect, Lang};
 
-fn build_tts_url(text: &str) -> String {
+fn build_tts_url(text: &str, lang: &str) -> String {
     format!(
-        "https://translate.google.com/translate_tts?ie=UTF-8&q={}&tl=ja&client=tw-ob",
-        encode(text)
+        "https://translate.google.com/translate_tts?ie=UTF-8&q={}&tl={}&client=tw-ob",
+        encode(text),
+        lang
     )
+}
+
+fn is_chinese(text: &str) -> bool {
+    detect(text)
+        .map(|info| matches!(info.lang(), Lang::Cmn))
+        .unwrap_or(false)
 }
 
 struct BotState;
@@ -106,7 +119,7 @@ impl EventHandler for Handler {
                                 .and_then(|o| o.value.as_ref())
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-                            let url = build_tts_url(text);
+                            let url = build_tts_url(text, "ja");
                             match ffmpeg(url).await {
                                 Ok(source) => {
                                     handler.lock().await.play_source(source);
@@ -130,15 +143,39 @@ impl EventHandler for Handler {
         }
     }
 
-    // 旧 prefix 処理を残す場合のみ実装
-    // async fn message(&self, ctx: Context, msg: Message) { ... }
+    async fn message(&self, ctx: Context, msg: Message) {
+        if msg.author.bot {
+            return;
+        }
+
+        if !is_chinese(&msg.content) {
+            return;
+        }
+
+        if let Some(guild_id) = msg.guild_id {
+            let data = ctx.data.read().await;
+            let map = data.get::<BotState>().unwrap().clone();
+            if let Some(vc) = map.lock().await.get(&guild_id).cloned() {
+                let manager = songbird::get(&ctx).await.unwrap().clone();
+                if let Some(handler) = manager.get(guild_id) {
+                    let url = build_tts_url(&msg.content, "zh-CN");
+                    if let Ok(source) = ffmpeg(url).await {
+                        handler.lock().await.play_source(source);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
     dotenv().ok();
     let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKENが設定されていません");
-    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
+    let intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_VOICE_STATES
+        | GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::MESSAGE_CONTENT;
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler)
         .register_songbird()
