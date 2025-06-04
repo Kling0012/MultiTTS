@@ -27,3 +27,14 @@ Rust 製の Discord ボイスチャットボットです。
    `/join` を実行したチャンネルに投稿されたメッセージは自動的に読み上げられ、中国語のメッセージは中国語で、それ以外は日本語で読み上げます。
 
 TTS 機能として Google Translate の読み上げ音声を利用しています。
+
+## Docker での起動
+
+Docker でも実行できます。まずイメージをビルドします。
+```bash
+docker build -t multitts .
+```
+`.env` で利用する環境変数を設定した上で、次のように起動します。
+```bash
+docker run --env-file .env multitts
+```
