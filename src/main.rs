@@ -1,6 +1,11 @@
 use serenity::{
     async_trait,
-    model::{gateway::Ready, id::GuildId, interaction::{Interaction, InteractionResponseType}},
+    model::{
+        gateway::Ready,
+        id::GuildId,
+        interactions::{Interaction, InteractionResponseType},
+        prelude::Message,
+    },
     prelude::*,
 };
 use songbird::{SerenityInit, input::ffmpeg};
@@ -9,10 +14,30 @@ use tokio::sync::Mutex;
 use dotenv::dotenv;
 use std::env;
 use urlencoding::encode;
+use whatlang::{detect, Lang};
+
+fn build_tts_url(text: &str, lang: &str) -> String {
+    format!(
+        "https://translate.google.com/translate_tts?ie=UTF-8&q={}&tl={}&client=tw-ob",
+        encode(text),
+        lang
+    )
+}
+
+fn is_chinese(text: &str) -> bool {
+    detect(text)
+        .map(|info| matches!(info.lang(), Lang::Cmn))
+        .unwrap_or(false)
+}
+
+struct GuildChannels {
+    voice: serenity::model::id::ChannelId,
+    text: serenity::model::id::ChannelId,
+}
 
 struct BotState;
 impl TypeMapKey for BotState {
-    type Value = Arc<Mutex<HashMap<GuildId, serenity::model::id::ChannelId>>>;
+    type Value = Arc<Mutex<HashMap<GuildId, GuildChannels>>>;
 }
 
 struct Handler;
@@ -28,12 +53,30 @@ impl EventHandler for Handler {
                 .parse()
                 .expect("DISCORD_GUILD_ID の値が無効です。数値である必要があります"),
         );
-        // /join と /leave スラッシュコマンドを登録
-        guild_id.set_guild_application_commands(&ctx.http, |commands| {
-            commands
-                .create_application_command(|cmd| cmd.name("join").description("VCに参加します"))
-                .create_application_command(|cmd| cmd.name("leave").description("VCから退出します"))
-        }).await.expect("コマンド登録失敗");
+        // スラッシュコマンドを登録
+        guild_id
+            .set_application_commands(&ctx.http, |commands| {
+                commands
+                    .create_application_command(|cmd| {
+                        cmd.name("join").description("VCに参加します")
+                    })
+                    .create_application_command(|cmd| {
+                        cmd.name("leave").description("VCから退出します")
+                    })
+                    .create_application_command(|cmd| {
+                        cmd
+                            .name("say")
+                            .description("指定したテキストを読み上げます")
+                            .create_option(|opt| {
+                                opt.kind(serenity::model::application::command::CommandOptionType::String)
+                                    .name("text")
+                                    .description("読み上げる内容")
+                                    .required(true)
+                            })
+                    })
+            })
+            .await
+            .expect("コマンド登録失敗");
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -45,10 +88,13 @@ impl EventHandler for Handler {
                         if let Some(vc) = member.voice.as_ref().and_then(|v| v.channel_id) {
                             let manager = songbird::get(&ctx).await.unwrap().clone();
                             let _ = manager.join(guild_id, vc).await;
-                            // 状態に保存
+                            // 状態に保存: ボイスチャネルと実行されたテキストチャネル
                             let data = ctx.data.read().await;
                             let map = data.get::<BotState>().unwrap().clone();
-                            map.lock().await.insert(guild_id, vc);
+                            map.lock().await.insert(
+                                guild_id,
+                                GuildChannels { voice: vc, text: cmd.channel_id },
+                            );
                             "✅ ボイスチャネルに参加しました。".to_string()
                         } else {
                             "⚠️ まずVCに参加してください。".to_string()
@@ -67,6 +113,35 @@ impl EventHandler for Handler {
                         "⚠️ VC参加情報がありません。".to_string()
                     }
                 }
+                "say" => {
+                    let guild_id = cmd.guild_id.unwrap();
+                    let data = ctx.data.read().await;
+                    let map = data.get::<BotState>().unwrap().clone();
+                    if map.lock().await.get(&guild_id).is_some() {
+                        let manager = songbird::get(&ctx).await.unwrap().clone();
+                        if let Some(handler) = manager.get(guild_id) {
+                            let text = cmd
+                                .data
+                                .options
+                                .get(0)
+                                .and_then(|o| o.value.as_ref())
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let url = build_tts_url(text, "ja");
+                            match ffmpeg(url).await {
+                                Ok(source) => {
+                                    handler.lock().await.play_source(source);
+                                    "💬 読み上げます。".to_string()
+                                }
+                                Err(_) => "❌ 音声取得に失敗しました。".to_string(),
+                            }
+                        } else {
+                            "⚠️ ボイスチャネル接続情報がありません。".to_string()
+                        }
+                    } else {
+                        "⚠️ 先に /join でVCに参加してください。".to_string()
+                    }
+                }
                 _ => return,
             };
             let _ = cmd.create_interaction_response(&ctx.http, |r| {
@@ -76,15 +151,37 @@ impl EventHandler for Handler {
         }
     }
 
-    // 旧 prefix 処理を残す場合のみ実装
-    // async fn message(&self, ctx: Context, msg: Message) { ... }
+    async fn message(&self, ctx: Context, msg: Message) {
+        if msg.author.bot {
+            return;
+        }
+
+        if let Some(guild_id) = msg.guild_id {
+            let data = ctx.data.read().await;
+            let map = data.get::<BotState>().unwrap().clone();
+            if let Some(chs) = map.lock().await.get(&guild_id) {
+                if msg.channel_id == chs.text && is_chinese(&msg.content) {
+                    let manager = songbird::get(&ctx).await.unwrap().clone();
+                    if let Some(handler) = manager.get(guild_id) {
+                        let url = build_tts_url(&msg.content, "zh-CN");
+                        if let Ok(source) = ffmpeg(url).await {
+                            handler.lock().await.play_source(source);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
     dotenv().ok();
     let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKENが設定されていません");
-    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
+    let intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_VOICE_STATES
+        | GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::MESSAGE_CONTENT;
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler)
         .register_songbird()
