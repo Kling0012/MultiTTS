@@ -3,8 +3,7 @@ use serenity::{
     model::{
         gateway::Ready,
         id::GuildId,
-        interaction::{Interaction, InteractionResponseType},
-        prelude::Message,
+        prelude::*,
     },
     prelude::*,
 };
@@ -15,6 +14,8 @@ use dotenv::dotenv;
 use std::env;
 use urlencoding::encode;
 use whatlang::{detect, Lang};
+
+
 
 fn build_tts_url(text: &str, lang: &str) -> String {
     format!(
@@ -30,7 +31,9 @@ fn is_chinese(text: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Clone)]
 struct ChannelInfo {
+    #[allow(dead_code)]
     voice: serenity::model::id::ChannelId,
     text: serenity::model::id::ChannelId,
 }
@@ -46,37 +49,30 @@ struct Handler;
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("✅ ログイン成功: {}", ready.user.name);
-        // ギルドIDを指定（複数ギルドやグローバル化は適宜変更）
-        let guild_id = GuildId(
-            env::var("DISCORD_GUILD_ID")
-                .expect("環境変数 DISCORD_GUILD_ID が設定されていません")
-                .parse()
-                .expect("DISCORD_GUILD_ID の値が無効です。数値である必要があります"),
-        );
-        // スラッシュコマンドを登録
-        guild_id
-            .set_guild_application_commands(&ctx.http, |commands| {
-                commands
-                    .create_application_command(|cmd| {
-                        cmd.name("join").description("VCに参加します")
-                    })
-                    .create_application_command(|cmd| {
-                        cmd.name("leave").description("VCから退出します")
-                    })
-                    .create_application_command(|cmd| {
-                        cmd
-                            .name("say")
-                            .description("指定したテキストを読み上げます")
-                            .create_option(|opt| {
-                                opt.kind(serenity::model::application::command::CommandOptionType::String)
-                                    .name("text")
-                                    .description("読み上げる内容")
-                                    .required(true)
-                            })
-                    })
-            })
-            .await
-            .expect("コマンド登録失敗");
+        
+        // グローバルスラッシュコマンドを登録（全てのギルドで使用可能）
+        serenity::model::application::command::Command::set_global_application_commands(&ctx.http, |commands| {
+            commands
+                .create_application_command(|cmd| {
+                    cmd.name("join").description("VCに参加します")
+                })
+                .create_application_command(|cmd| {
+                    cmd.name("leave").description("VCから退出します")
+                })
+                .create_application_command(|cmd| {
+                    cmd
+                        .name("say")
+                        .description("指定したテキストを読み上げます")
+                        .create_option(|opt| {
+                            opt.kind(serenity::model::application::command::CommandOptionType::String)
+                                .name("text")
+                                .description("読み上げる内容")
+                                .required(true)
+                        })
+                })
+        })
+        .await
+        .expect("グローバルコマンド登録失敗");
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
@@ -85,20 +81,26 @@ impl EventHandler for Handler {
                 "join" => {
                     let guild_id = cmd.guild_id.unwrap();
                     if let Some(member) = cmd.member.clone() {
-                        if let Some(vc) = member.voice.as_ref().and_then(|v| v.channel_id) {
-                            let manager = songbird::get(&ctx).await.unwrap().clone();
-                            let _ = manager.join(guild_id, vc).await;
-                            // 状態に保存
-                            let data = ctx.data.read().await;
-                            let map = data.get::<BotState>().unwrap().clone();
-                            map.lock().await.insert(
-                                guild_id,
-                                ChannelInfo {
-                                    voice: vc,
-                                    text: cmd.channel_id,
-                                },
-                            );
-                            "✅ ボイスチャネルに参加しました。".to_string()
+                        // ギルドからボイス状態を取得
+                        let guild = guild_id.to_guild_cached(&ctx.cache).unwrap();
+                        if let Some(voice_state) = guild.voice_states.get(&member.user.id) {
+                            if let Some(vc) = voice_state.channel_id {
+                                let manager = songbird::get(&ctx).await.unwrap().clone();
+                                let _ = manager.join(guild_id, vc).await;
+                                // 状態に保存
+                                let data = ctx.data.read().await;
+                                let map = data.get::<BotState>().unwrap().clone();
+                                map.lock().await.insert(
+                                    guild_id,
+                                    ChannelInfo {
+                                        voice: vc,
+                                        text: cmd.channel_id,
+                                    },
+                                );
+                                "✅ ボイスチャネルに参加しました。".to_string()
+                            } else {
+                                "⚠️ まずVCに参加してください。".to_string()
+                            }
                         } else {
                             "⚠️ まずVCに参加してください。".to_string()
                         }
@@ -120,7 +122,10 @@ impl EventHandler for Handler {
                     let guild_id = cmd.guild_id.unwrap();
                     let data = ctx.data.read().await;
                     let map = data.get::<BotState>().unwrap().clone();
-                    if let Some(info) = map.lock().await.get(&guild_id).cloned() {
+                    let info = map.lock().await.get(&guild_id).cloned();
+                    drop(data);  // データへの参照を早めに削除
+                    
+                    if let Some(_info) = info {
                         let manager = songbird::get(&ctx).await.unwrap().clone();
                         if let Some(handler) = manager.get(guild_id) {
                             let text = cmd
@@ -162,7 +167,10 @@ impl EventHandler for Handler {
         if let Some(guild_id) = msg.guild_id {
             let data = ctx.data.read().await;
             let map = data.get::<BotState>().unwrap().clone();
-            if let Some(info) = map.lock().await.get(&guild_id).cloned() {
+            let info = map.lock().await.get(&guild_id).cloned();
+            drop(data);  // データへの参照を早めに削除
+            
+            if let Some(info) = info {
                 if info.text == msg.channel_id {
                     let manager = songbird::get(&ctx).await.unwrap().clone();
                     if let Some(handler) = manager.get(guild_id) {
